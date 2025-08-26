@@ -1,0 +1,350 @@
+/*
+ * Student System — SQLite-backed (C, C99)
+ * Single-file console application.
+ *
+ * Compile: gcc -std=c99 student_system_sqlite.c -o student_system_sqlite -lsqlite3
+ *
+ * Features:
+ *  - Students, Courses, Enrollments stored in SQLite (student_system.db)
+ *  - Add/List/Delete (soft delete via 'active' flag)
+ *  - Enroll student in course, record grades
+ *  - Compute GPA using SQL joins
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sqlite3.h>
+
+#define NAME_LEN 128
+#define LINE_LEN 256
+#define DB_FILE "student_system.db"
+
+static sqlite3 *db = NULL;
+
+static void die(const char *msg){
+    fprintf(stderr, "Fatal: %s\n", msg);
+    if (db) sqlite3_close(db);
+    exit(EXIT_FAILURE);
+}
+
+static void trimnl(char *s){
+    size_t n = strlen(s);
+    while (n && (s[n-1]=='\n' || s[n-1]=='\r')) s[--n] = '\0';
+}
+
+static void open_db(void){
+    if (sqlite3_open(DB_FILE, &db) != SQLITE_OK) die("Could not open database.");
+    /* Create tables if they don't exist */
+    const char *schema =
+        "PRAGMA foreign_keys = ON;\n"
+        "CREATE TABLE IF NOT EXISTS students ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "name TEXT NOT NULL,"
+            "email TEXT NOT NULL UNIQUE,"
+            "year_level INTEGER NOT NULL,"
+            "active INTEGER NOT NULL DEFAULT 1"
+        ");\n"
+        "CREATE TABLE IF NOT EXISTS courses ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "code TEXT NOT NULL UNIQUE,"
+            "title TEXT NOT NULL,"
+            "units INTEGER NOT NULL,"
+            "active INTEGER NOT NULL DEFAULT 1"
+        ");\n"
+        "CREATE TABLE IF NOT EXISTS enrollments ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "student_id INTEGER NOT NULL,"
+            "course_id INTEGER NOT NULL,"
+            "grade REAL DEFAULT NULL,"
+            "active INTEGER NOT NULL DEFAULT 1,"
+            "FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,"
+            "FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE,"
+            "UNIQUE(student_id, course_id)"
+        ");\n";
+    char *err = NULL;
+    if (sqlite3_exec(db, schema, 0, 0, &err) != SQLITE_OK){
+        fprintf(stderr, "DB init error: %s\n", err);
+        sqlite3_free(err);
+        die("Failed to initialize DB schema.");
+    }
+}
+
+/* Helper input */
+static int read_int(const char *prompt, int minv, int maxv){
+    char line[LINE_LEN];
+    int v;
+    while (1){
+        printf("%s", prompt);
+        if (!fgets(line, sizeof line, stdin)) { clearerr(stdin); continue; }
+        if (sscanf(line, "%d", &v)==1 && v>=minv && v<=maxv) return v;
+        printf("  Enter integer in [%d..%d].\n", minv, maxv);
+    }
+}
+
+static double read_double(const char *prompt, double minv, double maxv){
+    char line[LINE_LEN];
+    double v;
+    while (1){
+        printf("%s", prompt);
+        if (!fgets(line, sizeof line, stdin)) { clearerr(stdin); continue; }
+        if (sscanf(line, "%lf", &v)==1 && v>=minv && v<=maxv) return v;
+        printf("  Enter number in [%.2f..%.2f].\n", minv, maxv);
+    }
+}
+
+static void read_str(const char *prompt, char *out, size_t sz){
+    char line[LINE_LEN];
+    while (1){
+        printf("%s", prompt);
+        if (!fgets(line, sizeof line, stdin)) { clearerr(stdin); continue; }
+        trimnl(line);
+        if (strlen(line)==0){ printf("  Cannot be empty.\n"); continue; }
+        if (strlen(line) >= sz){ printf("  Too long (max %zu).\n", sz-1); continue; }
+        strcpy(out, line);
+        return;
+    }
+}
+
+/* Add student */
+static void add_student(void){
+    char name[NAME_LEN], email[NAME_LEN];
+    int year;
+    read_str("Enter name: ", name, sizeof name);
+    read_str("Enter email: ", email, sizeof email);
+    year = read_int("Enter year level (1-5): ", 1, 5);
+
+    const char *sql = "INSERT INTO students (name,email,year_level,active) VALUES (?, ?, ?, 1);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "prepare failed: %s\n", sqlite3_errmsg(db)); return;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, email, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, year);
+    if (sqlite3_step(stmt) != SQLITE_DONE){
+        fprintf(stderr, "Insert failed: %s\n", sqlite3_errmsg(db));
+    } else {
+        printf("Student added. ID %lld\n", sqlite3_last_insert_rowid(db));
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* List students */
+static void list_students(void){
+    const char *sql = "SELECT id,name,email,year_level FROM students WHERE active=1 ORDER BY id;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) { fprintf(stderr, "prepare failed\n"); return; }
+    printf("\n%-4s  %-25s  %-25s  %-4s\n", "ID", "Name", "Email", "Year");
+    printf("-----------------------------------------------------------------\n");
+    while (sqlite3_step(stmt) == SQLITE_ROW){
+        int id = sqlite3_column_int(stmt,0);
+        const unsigned char *name = sqlite3_column_text(stmt,1);
+        const unsigned char *email = sqlite3_column_text(stmt,2);
+        int year = sqlite3_column_int(stmt,3);
+        printf("%-4d  %-25s  %-25s  %-4d\n", id, name, email, year);
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* Soft-delete student */
+static void delete_student(void){
+    int id = read_int("Enter student ID to delete: ", 1, 1000000);
+    const char *sql = "UPDATE students SET active=0 WHERE id=?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int(stmt,1,id);
+    if (sqlite3_step(stmt) != SQLITE_DONE) printf("Delete failed or not found.\n"); else printf("Student soft-deleted.\n");
+    sqlite3_finalize(stmt);
+}
+
+/* Add course */
+static void add_course(void){
+    char code[64], title[NAME_LEN];
+    int units;
+    read_str("Enter course code (e.g., CS101): ", code, sizeof code);
+    read_str("Enter title: ", title, sizeof title);
+    units = read_int("Enter units (1-6): ", 1, 6);
+
+    const char *sql = "INSERT INTO courses (code,title,units,active) VALUES (?, ?, ?, 1);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(stmt,1,code,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt,2,title,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt,3,units);
+    if (sqlite3_step(stmt) != SQLITE_DONE) printf("Insert failed: %s\n", sqlite3_errmsg(db));
+    else printf("Course added. ID %lld\n", sqlite3_last_insert_rowid(db));
+    sqlite3_finalize(stmt);
+}
+
+/* List courses */
+static void list_courses(void){
+    const char *sql = "SELECT id,code,title,units FROM courses WHERE active=1 ORDER BY id;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
+    printf("\n%-4s  %-8s  %-32s  %-5s\n", "ID", "Code", "Title", "Units");
+    printf("---------------------------------------------------------------\n");
+    while (sqlite3_step(stmt) == SQLITE_ROW){
+        int id = sqlite3_column_int(stmt,0);
+        const unsigned char *code = sqlite3_column_text(stmt,1);
+        const unsigned char *title = sqlite3_column_text(stmt,2);
+        int units = sqlite3_column_int(stmt,3);
+        printf("%-4d  %-8s  %-32s  %-5d\n", id, code, title, units);
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* Soft-delete course */
+static void delete_course(void){
+    int id = read_int("Enter course ID to delete: ", 1, 1000000);
+    const char *sql = "UPDATE courses SET active=0 WHERE id=?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int(stmt,1,id);
+    if (sqlite3_step(stmt) != SQLITE_DONE) printf("Delete failed or not found.\n"); else printf("Course soft-deleted.\n");
+    sqlite3_finalize(stmt);
+}
+
+/* Enroll student in course */
+static void enroll_student(void){
+    int sid = read_int("Student ID: ", 1, 1000000);
+    int cid = read_int("Course ID: ", 1, 1000000);
+    const char *sql = "INSERT INTO enrollments (student_id,course_id,grade,active) VALUES (?, ?, NULL, 1);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int(stmt,1,sid);
+    sqlite3_bind_int(stmt,2,cid);
+    if (sqlite3_step(stmt) != SQLITE_DONE){
+        fprintf(stderr, "Enrollment failed: %s\n", sqlite3_errmsg(db));
+    } else {
+        printf("Enrollment created. ID %lld\n", sqlite3_last_insert_rowid(db));
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* List enrollments */
+static void list_enrollments(void){
+    const char *sql =
+        "SELECT e.id, e.student_id, s.name, e.course_id, c.code, e.grade "
+        "FROM enrollments e "
+        "LEFT JOIN students s ON s.id=e.student_id "
+        "LEFT JOIN courses c ON c.id=e.course_id "
+        "WHERE e.active=1 ORDER BY e.id;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
+    printf("\n%-4s  %-6s  %-20s  %-6s  %-6s  %-6s\n", "ID","Stud","StudentName","CrsID","Code","Grade");
+    printf("-----------------------------------------------------------------------\n");
+    while (sqlite3_step(stmt) == SQLITE_ROW){
+        int id = sqlite3_column_int(stmt,0);
+        int sid = sqlite3_column_int(stmt,1);
+        const unsigned char *sname = sqlite3_column_text(stmt,2);
+        int cid = sqlite3_column_int(stmt,3);
+        const unsigned char *ccode = sqlite3_column_text(stmt,4);
+        double grade = 0;
+        int has_grade = (sqlite3_column_type(stmt,5) != SQLITE_NULL);
+        if (has_grade) grade = sqlite3_column_double(stmt,5);
+        printf("%-4d  %-6d  %-20s  %-6d  %-6s  %s%.2f\n",
+               id, sid, sname ? sname : (const unsigned char *)"(null)",
+               cid, ccode ? ccode : (const unsigned char *)"(null)",
+               has_grade ? "" : "N/A ", has_grade ? grade : 0.0);
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* Record grade */
+static void record_grade(void){
+    int eid = read_int("Enrollment ID: ", 1, 1000000);
+    double g = read_double("Enter grade (0-100): ", 0.0, 100.0);
+    const char *sql = "UPDATE enrollments SET grade=? WHERE id=? AND active=1;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
+    sqlite3_bind_double(stmt,1,g);
+    sqlite3_bind_int(stmt,2,eid);
+    if (sqlite3_step(stmt) != SQLITE_DONE) printf("Update failed or not found.\n"); else printf("Grade recorded.\n");
+    sqlite3_finalize(stmt);
+}
+
+/* Compute GPA for a student (SQL handles join & weighted avg) */
+static void compute_gpa(void){
+    int sid = read_int("Student ID: ", 1, 1000000);
+
+    /* We'll convert numeric grade -> points using CASE (same mapping as earlier)
+       Then compute weighted average: SUM(points * units) / SUM(units)
+    */
+    const char *sql =
+        "SELECT COUNT(e.id) AS graded_courses, SUM(c.units) AS total_units, "
+        "SUM( (CASE "
+            "WHEN e.grade >= 90 THEN 4.0 "
+            "WHEN e.grade >= 80 THEN 3.0 "
+            "WHEN e.grade >= 70 THEN 2.0 "
+            "WHEN e.grade >= 60 THEN 1.0 "
+            "ELSE 0.0 END) * c.units) AS total_points "
+        "FROM enrollments e "
+        "JOIN courses c ON c.id = e.course_id "
+        "WHERE e.student_id = ? AND e.active=1 AND e.grade IS NOT NULL AND c.active=1;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK){
+        fprintf(stderr, "prepare err: %s\n", sqlite3_errmsg(db)); return;
+    }
+    sqlite3_bind_int(stmt,1,sid);
+    if (sqlite3_step(stmt) == SQLITE_ROW){
+        int graded = sqlite3_column_int(stmt,0);
+        int total_units = sqlite3_column_int(stmt,1);
+        double total_points = sqlite3_column_double(stmt,2);
+        if (total_units == 0){
+            printf("No graded enrollments for student %d.\n", sid);
+        } else {
+            double gpa = total_points / (double)total_units;
+            printf("GPA for student %d: %.3f across %d graded course(s), %d unit(s).\n",
+                   sid, gpa, graded, total_units);
+        }
+    } else {
+        printf("No data.\n");
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* Menu */
+static void menu(void){
+    puts("\n=== Student System (SQLite) ===");
+    puts("1) Add Student");
+    puts("2) List Students");
+    puts("3) Delete Student (soft)");
+    puts("4) Add Course");
+    puts("5) List Courses");
+    puts("6) Delete Course (soft)");
+    puts("7) Enroll Student in Course");
+    puts("8) List Enrollments");
+    puts("9) Record Grade");
+    puts("10) Compute Student GPA");
+    puts("0) Exit");
+}
+
+int main(void){
+    open_db();
+
+    while (1){
+        menu();
+        int choice = read_int("Choose: ", 0, 10);
+        switch (choice){
+            case 1: add_student(); break;
+            case 2: list_students(); break;
+            case 3: delete_student(); break;
+            case 4: add_course(); break;
+            case 5: list_courses(); break;
+            case 6: delete_course(); break;
+            case 7: enroll_student(); break;
+            case 8: list_enrollments(); break;
+            case 9: record_grade(); break;
+            case 10: compute_gpa(); break;
+            case 0:
+                sqlite3_close(db);
+                puts("Goodbye!");
+                return 0;
+            default: puts("Invalid choice."); break;
+        }
+    }
+
+    return 0;
+}
